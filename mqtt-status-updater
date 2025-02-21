@@ -1,0 +1,71 @@
+#! python3
+
+import logging
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+import random
+from paho.mqtt import client as mqtt_client
+
+MQTT_BROKER = "192.168.14.2"
+MQTT_PORT = 1883
+MQTT_TOPIC = "dct/active"
+MQTT_USERNAME = "user"
+MQTT_PASSWORD = "password"
+MQTT_CLIENT_ID = f'python-mqtt-{random.randint(0, 1000)}'
+
+LAST_STATE = True
+BACKGROUP_UPDATE_INTERVAL = 5
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("HA_Desktop_Status")
+
+client = mqtt_client.Client(MQTT_CLIENT_ID)
+client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+client.connect(MQTT_BROKER, MQTT_PORT)
+
+def exit_gracefully(signum=0, frame=None):
+    logger.info('Exiting now')
+    loop.quit()
+    ha_update_status(True)
+    exit(0)
+
+def set_dbus_loop():
+    DBusGMainLoop(set_as_default=True)
+    session_bus = dbus.SessionBus()
+    session_bus.add_signal_receiver(dbus_lock_handler,
+                                    dbus_interface="org.gnome.ScreenSaver",
+                                    signal_name="ActiveChanged")
+    loop = GLib.MainLoop()
+    return loop
+
+def dbus_lock_handler(is_locked):
+    global LAST_STATE
+    if is_locked:
+        logger.info('The computer is now locked')
+        LAST_STATE = True
+    else:
+        logger.info('The computer is now unlocked')
+        LAST_STATE = False
+    ha_update_status(LAST_STATE)
+
+def ha_update_status(locked):
+    if not client.is_connected:
+        client.reconnect()
+    if locked:
+        msg = '{"state": "OFF"}'
+    else:
+        msg = '{"state": "ON"}'
+    result = client.publish(MQTT_TOPIC, msg)
+    if result[0] == 0:
+        logger.info(f"Send `{msg}` to topic `{MQTT_TOPIC}`")
+    else:
+        logger.info(f"Failed to send message to topic {MQTT_TOPIC}")
+
+if __name__ == '__main__':
+    try:
+        ha_update_status(False)
+        loop = set_dbus_loop()
+        loop.run()
+    except KeyboardInterrupt:
+        exit_gracefully()
