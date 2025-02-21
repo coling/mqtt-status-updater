@@ -1,5 +1,6 @@
-#! python3
+#!/usr/bin/python
 
+# Inspired by https://community.home-assistant.io/t/linux-gnome-retreive-the-lock-or-unlock-state-of-your-linux-computer/181489/4
 import logging
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
@@ -7,18 +8,34 @@ from gi.repository import GLib
 import random
 from paho.mqtt import client as mqtt_client
 
-MQTT_BROKER = "192.168.14.2"
+# For Watchdog timestamp
+from datetime import datetime
+
+# For payload formatting
+import json
+
+# For IP checks
+import socket
+import fcntl
+import struct
+
+# For current user (and thus topic)
+import getpass
+
+LAN_INTERFACE = ''
+MQTT_BROKER = ""
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
+
 MQTT_PORT = 1883
-MQTT_TOPIC = "dct/active"
-MQTT_USERNAME = "user"
-MQTT_PASSWORD = "password"
+MQTT_BASE_TOPIC = "gnome/" + getpass.getuser()
 MQTT_CLIENT_ID = f'python-mqtt-{random.randint(0, 1000)}'
 
-LAST_STATE = True
-BACKGROUP_UPDATE_INTERVAL = 5
+
+state = {'lastseen': 0, 'locked': True, 'lan': False}
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("HA_Desktop_Status")
+logger = logging.getLogger("MQTT_Desktop_Status")
 
 client = mqtt_client.Client(MQTT_CLIENT_ID)
 client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
@@ -27,45 +44,68 @@ client.connect(MQTT_BROKER, MQTT_PORT)
 def exit_gracefully(signum=0, frame=None):
     logger.info('Exiting now')
     loop.quit()
-    ha_update_status(True)
+    update_mqtt_locked_state(True, False)
     exit(0)
+   
+def update_mqtt():
+    global state
+    if not client.is_connected:
+        client.reconnect()
+    topic = MQTT_BASE_TOPIC
+    msg = json.dumps(state)
+    result = client.publish(topic, msg)
+    if result[0] == 0:
+        logger.info(f"Send `{msg}` to topic `{topic}`")
+    else:
+        logger.info(f"Failed to send message to topic {topic}")
+
+# From https://stackoverflow.com/a/1947766
+def get_interface_ip(ifname):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+                s.fileno(),
+                0x8915,  # SIOCGIFADDR
+                struct.pack('256s', bytes(ifname[:15], 'utf-8'))
+                # Python 2.7: remove the second argument for the bytes call
+            )[20:24])
+    except:
+        pass
+    return None
+
+def watchdog():
+    global state
+    state['lastseen'] = datetime.now().timestamp()
+    if LAN_INTERFACE:
+        state['lan'] = bool(get_interface_ip(LAN_INTERFACE))
+    update_mqtt()
+    return True
 
 def set_dbus_loop():
     DBusGMainLoop(set_as_default=True)
     session_bus = dbus.SessionBus()
-    session_bus.add_signal_receiver(dbus_lock_handler,
+    session_bus.add_signal_receiver(update_mqtt_locked_state,
                                     dbus_interface="org.gnome.ScreenSaver",
                                     signal_name="ActiveChanged")
     loop = GLib.MainLoop()
+    GLib.timeout_add(5000, watchdog)
     return loop
 
-def dbus_lock_handler(is_locked):
-    global LAST_STATE
-    if is_locked:
-        logger.info('The computer is now locked')
-        LAST_STATE = True
-    else:
-        logger.info('The computer is now unlocked')
-        LAST_STATE = False
-    ha_update_status(LAST_STATE)
-
-def ha_update_status(locked):
-    if not client.is_connected:
-        client.reconnect()
-    if locked:
-        msg = '{"state": "OFF"}'
-    else:
-        msg = '{"state": "ON"}'
-    result = client.publish(MQTT_TOPIC, msg)
-    if result[0] == 0:
-        logger.info(f"Send `{msg}` to topic `{MQTT_TOPIC}`")
-    else:
-        logger.info(f"Failed to send message to topic {MQTT_TOPIC}")
+def update_mqtt_locked_state(is_locked, log = True):
+    global state
+    state['locked'] = bool(is_locked)
+    if log:
+        msg = 'The computer is now unlocked'
+        if is_locked:
+            msg = 'The computer is now locked'
+        logger.info(msg)
+    watchdog()    
 
 if __name__ == '__main__':
     try:
-        ha_update_status(False)
+        update_mqtt_locked_state(False, False)
         loop = set_dbus_loop()
         loop.run()
     except KeyboardInterrupt:
         exit_gracefully()
+
