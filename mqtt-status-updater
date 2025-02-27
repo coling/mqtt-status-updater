@@ -6,7 +6,7 @@ import dbus
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 import random
-from paho.mqtt import client as mqtt_client
+import paho.mqtt.publish as mqtt
 
 # For Watchdog timestamp
 from datetime import datetime
@@ -20,15 +20,19 @@ import fcntl
 import struct
 
 # For current user (and thus topic)
-import getpass
+import os
+import pwd
 
-LAN_INTERFACE = ''
+username = os.getlogin()
+fullname = pwd.getpwuid(os.geteuid()).pw_gecos
+
+LAN_INTERFACE = ""
 MQTT_BROKER = ""
 MQTT_USERNAME = ""
 MQTT_PASSWORD = ""
 
 MQTT_PORT = 1883
-MQTT_BASE_TOPIC = "gnome/" + getpass.getuser()
+MQTT_BASE_TOPIC = "gnome/" + username
 MQTT_CLIENT_ID = f'python-mqtt-{random.randint(0, 1000)}'
 
 
@@ -36,10 +40,6 @@ state = {'lastseen': 0, 'locked': True, 'lan': False}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MQTT_Desktop_Status")
-
-client = mqtt_client.Client(MQTT_CLIENT_ID)
-client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-client.connect(MQTT_BROKER, MQTT_PORT)
 
 def exit_gracefully(signum=0, frame=None):
     logger.info('Exiting now')
@@ -49,15 +49,15 @@ def exit_gracefully(signum=0, frame=None):
    
 def update_mqtt():
     global state
-    if not client.is_connected:
-        client.reconnect()
+
     topic = MQTT_BASE_TOPIC
     msg = json.dumps(state)
-    result = client.publish(topic, msg)
-    if result[0] == 0:
+    try:
+        mqtt.single(topic, msg, hostname=MQTT_BROKER, auth={'username':MQTT_USERNAME,'password':MQTT_PASSWORD})
         logger.info(f"Send `{msg}` to topic `{topic}`")
-    else:
+    except:
         logger.info(f"Failed to send message to topic {topic}")
+        pass
 
 # From https://stackoverflow.com/a/1947766
 def get_interface_ip(ifname):
