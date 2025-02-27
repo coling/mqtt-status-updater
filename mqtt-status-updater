@@ -52,7 +52,13 @@ ha_autodiscovery_sent = False
 state = {'lastseen': 0, 'locked': True, 'lan': False}
 watchdog_messages_suppressed = 0
 
-logging.basicConfig(level=logging.INFO)
+loglevel = logging.INFO
+logconfig = config.get('log', 'level', fallback='')
+if logconfig:
+    levels = logging.getLevelNamesMapping()
+    if logconfig in levels:
+        loglevel = levels[logconfig]
+logging.basicConfig(level=loglevel)
 logger = logging.getLogger("MQTT_Desktop_Status")
 
 def exit_gracefully(signum=0, frame=None):
