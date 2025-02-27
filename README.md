@@ -38,7 +38,7 @@ port=1883 # This is the default
 topic=your/status/topic # Defaults to mqtt_status_updater/username
 
 [lan]
-interface=enp0s13f0u1u3
+interface=enp0s12f0u2u2
 
 [homeassistant]
 basetopic=homeassistant # This is the defaults - used for autodiscovery

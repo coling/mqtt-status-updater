@@ -1,0 +1,16 @@
+[mqtt]
+host=192.168.123.123
+username=mqtt
+password=supersecret
+port=1883 # This is the default
+topic=your/status/topic # Defaults to mqtt_status_updater/username
+
+[lan]
+interface=enp0s12f0u2u2
+
+[homeassistant]
+basetopic=homeassistant # This is the defaults - used for autodiscovery
+uniqueid=flooble # Your sensor/device's unique id - defaults to mqtt_status_updater_username
+
+[log]
+level=INFO # The default - can be set to DEBUG or other constant name for more details
