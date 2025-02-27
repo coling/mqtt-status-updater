@@ -23,22 +23,29 @@ import struct
 import os
 import pwd
 
+# For config
+import configparser
+
 username = os.getlogin()
 fullname = pwd.getpwuid(os.geteuid()).pw_gecos
 
-LAN_INTERFACE = ""
-MQTT_BROKER = ""
-MQTT_USERNAME = ""
-MQTT_PASSWORD = ""
+config = configparser.ConfigParser()
+config.read(os.path.expanduser('~/.config/mqtt-status-updater.conf'))
 
-MQTT_PORT = 1883
-MQTT_BASE_TOPIC = "gnome/" + username
-MQTT_CLIENT_ID = f'python-mqtt-{random.randint(0, 1000)}'
+mqtt_host = config.get('mqtt', 'host', fallback='localhost')
+mqtt_port = int(config.get('mqtt', 'port', fallback='1883'))
+mqtt_auth = {
+  'username': config.get('mqtt', 'username', fallback=''),
+  'password': config.get('mqtt', 'password', fallback='')
+}
 
+lan_interface = config.get('lan', 'interface', fallback='')
 
-state = {'lastseen': 0, 'locked': True, 'lan': False}
+mqtt_topic = config.get('mqtt', 'topic', fallback='mqtt_status_updater/' + username)
 
 ha_autodiscovery_sent = False
+
+state = {'lastseen': 0, 'locked': True, 'lan': False}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MQTT_Desktop_Status")
@@ -50,37 +57,40 @@ def exit_gracefully(signum=0, frame=None):
     exit(0)
    
 def update_mqtt():
-    global state, ha_autodiscovery_sent
+    global ha_autodiscovery_sent
 
     if not ha_autodiscovery_sent:
         try:
-            ha_autodiscovery_topic = 'homeassistant/sensor/gnome_' + username + '/config'
+            ha_base_topic = config.get('homeassistant', 'basetopic', fallback='homeassistant')
+            ha_unique_id = config.get('homeassistant', 'uniqueid', fallback='mqtt_status_updater_' + username)
+            ha_device_name = config.get('homeassistant', 'devicename', fallback=fullname + "'s Computer")
+
+            ha_autodiscovery_topic = ha_base_topic + '/sensor/' + ha_unique_id + '/config'
             ha_autodiscovery_data = {
                 "name": 'At Desk',
-                "state_topic": MQTT_BASE_TOPIC,
+                "state_topic": mqtt_topic,
                 "value_template": "{{ iif( ( ( ( as_timestamp( utcnow() ) - value_json.lastseen ) < 30 ) and ( value_json.lan ) and ( not value_json.locked ) ), 'Yes', 'No' ) }}",
-                "unique_id": 'gnome_' + username,
+                "unique_id": ha_unique_id,
                 "device": {
-                    "name": fullname + "'s Computer",
+                    "name": ha_device_name,
                     "identifiers": [
-                        'gnome_' + username
+                        ha_unique_id
                     ]
                 }
             }
-            mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=MQTT_BROKER, auth={'username':MQTT_USERNAME,'password':MQTT_PASSWORD})
+            mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
             ha_autodiscovery_sent = True
             logger.info(f"Sent HA Autodiscovery Data")
         except:
             logger.info(f"Cannot send HA Autodiscovery Data")
             pass
 
-    topic = MQTT_BASE_TOPIC
-    msg = json.dumps(state)
     try:
-        mqtt.single(topic, msg, hostname=MQTT_BROKER, auth={'username':MQTT_USERNAME,'password':MQTT_PASSWORD})
-        logger.info(f"Send `{msg}` to topic `{topic}`")
+        msg = json.dumps(state)
+        mqtt.single(mqtt_topic, msg, hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
+        logger.info(f"Send `{msg}` to topic `{mqtt_topic}`")
     except:
-        logger.info(f"Failed to send message to topic {topic}")
+        logger.info(f"Failed to send message to topic {mqtt_topic}")
         pass
 
 # From https://stackoverflow.com/a/1947766
@@ -100,8 +110,8 @@ def get_interface_ip(ifname):
 def watchdog():
     global state
     state['lastseen'] = datetime.now().timestamp()
-    if LAN_INTERFACE:
-        state['lan'] = bool(get_interface_ip(LAN_INTERFACE))
+    if lan_interface:
+        state['lan'] = bool(get_interface_ip(lan_interface))
     update_mqtt()
     return True
 
