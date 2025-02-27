@@ -38,6 +38,8 @@ MQTT_CLIENT_ID = f'python-mqtt-{random.randint(0, 1000)}'
 
 state = {'lastseen': 0, 'locked': True, 'lan': False}
 
+ha_autodiscovery_sent = False
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MQTT_Desktop_Status")
 
@@ -48,7 +50,29 @@ def exit_gracefully(signum=0, frame=None):
     exit(0)
    
 def update_mqtt():
-    global state
+    global state, ha_autodiscovery_sent
+
+    if not ha_autodiscovery_sent:
+        try:
+            ha_autodiscovery_topic = 'homeassistant/sensor/gnome_' + username + '/config'
+            ha_autodiscovery_data = {
+                "name": 'At Desk',
+                "state_topic": MQTT_BASE_TOPIC,
+                "value_template": "{{ iif( ( ( ( as_timestamp( utcnow() ) - value_json.lastseen ) < 30 ) and ( value_json.lan ) and ( not value_json.locked ) ), 'Yes', 'No' ) }}",
+                "unique_id": 'gnome_' + username,
+                "device": {
+                    "name": fullname + "'s Computer",
+                    "identifiers": [
+                        'gnome_' + username
+                    ]
+                }
+            }
+            mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=MQTT_BROKER, auth={'username':MQTT_USERNAME,'password':MQTT_PASSWORD})
+            ha_autodiscovery_sent = True
+            logger.info(f"Sent HA Autodiscovery Data")
+        except:
+            logger.info(f"Cannot send HA Autodiscovery Data")
+            pass
 
     topic = MQTT_BASE_TOPIC
     msg = json.dumps(state)
