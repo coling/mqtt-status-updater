@@ -26,6 +26,10 @@ import pwd
 # For config
 import configparser
 
+
+WATCHDOG_TIMEOUT = 5   # Send watchdog every 5s
+WATCHDOG_LOG_COUNT = 24 # Log every WATCHDOG_LOG_COUNT * WATCHDOG_TIMEOUT seconds
+
 username = os.getlogin()
 fullname = pwd.getpwuid(os.geteuid()).pw_gecos
 
@@ -46,6 +50,7 @@ mqtt_topic = config.get('mqtt', 'topic', fallback='mqtt_status_updater/' + usern
 ha_autodiscovery_sent = False
 
 state = {'lastseen': 0, 'locked': True, 'lan': False}
+watchdog_messages_suppressed = 0
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("MQTT_Desktop_Status")
@@ -56,8 +61,8 @@ def exit_gracefully(signum=0, frame=None):
     update_mqtt_locked_state(True, False)
     exit(0)
    
-def update_mqtt():
-    global ha_autodiscovery_sent
+def update_mqtt(reason):
+    global ha_autodiscovery_sent, watchdog_messages_suppressed
 
     if not ha_autodiscovery_sent:
         try:
@@ -80,17 +85,25 @@ def update_mqtt():
             }
             mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
             ha_autodiscovery_sent = True
-            logger.info(f"Sent HA Autodiscovery Data")
+            logger.info('Sent Home Assistant Autodiscovery Data')
         except:
-            logger.info(f"Cannot send HA Autodiscovery Data")
+            logger.warning('Cannot send Home Assistant Autodiscovery Data')
             pass
 
     try:
         msg = json.dumps(state)
         mqtt.single(mqtt_topic, msg, hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
-        logger.info(f"Send `{msg}` to topic `{mqtt_topic}`")
+        if reason != 'watchdog' or not watchdog_messages_suppressed or watchdog_messages_suppressed >= WATCHDOG_LOG_COUNT:
+            suffix = ''
+            if watchdog_messages_suppressed > 1:
+                suffix = ' (' + str(watchdog_messages_suppressed - 1) + ' watchdog msgs suppressed)';
+            logger.info(f"Trigger '{reason}': Sent {msg} to topic '{mqtt_topic}'{suffix}")
+            watchdog_messages_suppressed = 1
+        else:
+            logger.debug(f"Trigger '{reason}': Sent {msg} to topic '{mqtt_topic}'")
+            watchdog_messages_suppressed = watchdog_messages_suppressed + 1
     except:
-        logger.info(f"Failed to send message to topic {mqtt_topic}")
+        logger.warning(f"Failed to send message to topic '{mqtt_topic}'")
         pass
 
 # From https://stackoverflow.com/a/1947766
@@ -107,12 +120,15 @@ def get_interface_ip(ifname):
         pass
     return None
 
-def watchdog():
+def watchdog(reason='watchdog'):
     global state
     state['lastseen'] = datetime.now().timestamp()
     if lan_interface:
-        state['lan'] = bool(get_interface_ip(lan_interface))
-    update_mqtt()
+        lanstate = bool(get_interface_ip(lan_interface))
+        if state['lan'] != lanstate:
+            state['lan'] = lanstate
+            reason = 'lanstate'
+    update_mqtt(reason)
     return True
 
 def set_dbus_loop():
@@ -122,7 +138,7 @@ def set_dbus_loop():
                                     dbus_interface="org.gnome.ScreenSaver",
                                     signal_name="ActiveChanged")
     loop = GLib.MainLoop()
-    GLib.timeout_add(5000, watchdog)
+    GLib.timeout_add(WATCHDOG_TIMEOUT * 1000, watchdog)
     return loop
 
 def update_mqtt_locked_state(is_locked, log = True):
@@ -133,7 +149,7 @@ def update_mqtt_locked_state(is_locked, log = True):
         if is_locked:
             msg = 'The computer is now locked'
         logger.info(msg)
-    watchdog()    
+    watchdog('lock')
 
 if __name__ == '__main__':
     try:
