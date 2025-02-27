@@ -61,3 +61,8 @@ But for now, this serves it's purpose fine my needs.
 ## License
 
 The work I have done is under the LGPLv3. I've not thoroughly checked the bits where I've copied code from the various sources cited in the code
+
+## Credits
+
+ * [vlycop](https://community.home-assistant.io/u/vlycop) of Home Assistant Community
+ * [Juan Rodríguez](https://community.home-assistant.io/u/cazbrat) of Home Assistant Community
