@@ -57,3 +57,7 @@ Support other desktops (e.g. KDE)
 The MQTT connection and loop could be made a bit nicer. With an established connection I could probably move away from a timestamp and instead use availability information of the writer to know when a computer might have just disappeared (laptop lid closed but no time to send status update)
 
 But for now, this serves it's purpose fine my needs.
+
+## License
+
+The work I have done is under the LGPLv3. I've not thoroughly checked the bits where I've copied code from the various sources cited in the code
