@@ -4,7 +4,7 @@ This is a very simply python script to send desktop status information into MQTT
 
 It is able to sent two important pieces of information into MQTT/HA and these are:
  * Whether or not the screen is locked
- * Whether or not we are connected to a LAN
+ * Whether or not you are connected to a LAN
 
 This information can be used for whatever purposes you like but by default a "Computer" device is created with an "At Desk" sensor.
 
