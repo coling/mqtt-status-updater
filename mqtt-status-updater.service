@@ -1,0 +1,8 @@
+[Unit]
+Description=MQTT Desktop Status Updater
+
+[Service]
+ExecStart=/usr/bin/mqtt-status-updater
+
+[Install]
+WantedBy=basic.target
