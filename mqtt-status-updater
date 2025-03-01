@@ -97,7 +97,6 @@ def update_mqtt(reason):
         except:
             if log_failure:
                 logger.warning('Cannot send Home Assistant Autodiscovery Data')
-                log_failure = False
             pass
 
     try:
