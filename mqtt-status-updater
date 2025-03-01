@@ -48,6 +48,7 @@ lan_interface = config.get('lan', 'interface', fallback='')
 mqtt_topic = config.get('mqtt', 'topic', fallback='mqtt_status_updater/' + username)
 
 ha_autodiscovery_sent = False
+log_failure = True
 
 state = {'lastseen': 0, 'locked': True, 'lan': False}
 watchdog_messages_suppressed = 0
@@ -68,7 +69,7 @@ def exit_gracefully(signum=0, frame=None):
     exit(0)
    
 def update_mqtt(reason):
-    global ha_autodiscovery_sent, watchdog_messages_suppressed
+    global ha_autodiscovery_sent, watchdog_messages_suppressed, log_failure
 
     if not ha_autodiscovery_sent:
         try:
@@ -92,8 +93,11 @@ def update_mqtt(reason):
             mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
             ha_autodiscovery_sent = True
             logger.info('Sent Home Assistant Autodiscovery Data')
+            log_failure = True
         except:
-            logger.warning('Cannot send Home Assistant Autodiscovery Data')
+            if log_failure:
+                logger.warning('Cannot send Home Assistant Autodiscovery Data')
+                log_failure = False
             pass
 
     try:
@@ -108,8 +112,11 @@ def update_mqtt(reason):
         else:
             logger.debug(f"Trigger '{reason}': Sent {msg} to topic '{mqtt_topic}'")
             watchdog_messages_suppressed = watchdog_messages_suppressed + 1
+        log_failure = True
     except:
-        logger.warning(f"Failed to send message to topic '{mqtt_topic}'")
+        if log_failure:
+            logger.warning(f"Failed to send message to topic '{mqtt_topic}'")
+            log_failure = False
         pass
 
 # From https://stackoverflow.com/a/1947766
