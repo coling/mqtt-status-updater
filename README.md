@@ -8,7 +8,9 @@ It is able to sent two important pieces of information into MQTT/HA and these ar
 
 This information can be used for whatever purposes you like but by default a "Computer" device is created with an "At Desk" sensor.
 
-This is defined as when you are both connected to the LAN and the screen is unlocked with a status update having been seen within 30s
+This is defined as when you are both connected to the LAN and the screen is unlocked.
+
+The script keeps one MQTT connection open. The discovery config, the state and an availability topic (`<topic>/availability`) are retained, and all of them are sent again whenever the connection is re-established or Home Assistant restarts (it listens for `online` on `homeassistant/status`). A last will marks the computer `offline` if the connection drops, and the script also marks itself offline before suspend and when stopped, so the sensor becomes `unavailable` rather than keeping its last value. If you use the sensor in an automation, treat `unavailable` (say for a minute) like `No`.
 
 I use this to control desk/monitor back lights etc without any further hardware sensors (e.g. a chair pressure sensor)
 
@@ -20,7 +22,8 @@ While a LAN connection might not mean YOUR LAN (e.g. office vs home) due to the 
 
  * Copy the ```mqtt-status-updater``` file to ```/usr/bin/```
  * Copy the ```mqtt-status-updater.service``` file to ```/usr/lib/systemd/user``` (or ```/etc/systemd/user```)
- * Call ```systemctl --user daemon-reload``` then ```systemctl --user enable mqtt-status-updater.service``` and ```systemctl --user start mqtt-status-updater.service```
+ * Call ```systemctl --user daemon-reload``` then ```systemctl --user enable --now mqtt-status-updater.service```
+ * The unit starts with your graphical session and restarts if it fails. If you installed an older version (which used `basic.target`), run `systemctl --user disable mqtt-status-updater.service` before enabling it again.
  * Ensure you configure things in your ```~/.config/mqtt-status-updater.conf``` file.
 
 ## Configuration
@@ -36,6 +39,7 @@ username=mqtt
 password=supersecret
 port=1883 # This is the default
 topic=your/status/topic # Defaults to mqtt_status_updater/username
+keepalive=15 # Seconds; the broker marks the computer offline after about 1.5x this
 
 [lan]
 interface=enp0s12f0u2u2
@@ -43,6 +47,8 @@ interface=enp0s12f0u2u2
 [homeassistant]
 basetopic=homeassistant # This is the defaults - used for autodiscovery
 uniqueid=flooble # Your sensor/device's unique id - defaults to mqtt_status_updater_username
+devicename=My Computer # Defaults to "<your full name>'s Computer"
+statustopic=homeassistant/status # Home Assistant's birth message topic - defaults to <basetopic>/status
 
 [log]
 level=INFO # The default - can be set to DEBUG or other constant name for more details
@@ -53,8 +59,6 @@ level=INFO # The default - can be set to DEBUG or other constant name for more d
 It would be nice to know the screen blanking state rather than lock state, so e.g. the login prompt under GDM triggers the lights
 
 Support other desktops (e.g. KDE)
-
-The MQTT connection and loop could be made a bit nicer. With an established connection I could probably move away from a timestamp and instead use availability information of the writer to know when a computer might have just disappeared (laptop lid closed but no time to send status update)
 
 But for now, this serves it's purpose fine my needs.
 

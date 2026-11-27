@@ -1,173 +1,250 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 # Inspired by https://community.home-assistant.io/t/linux-gnome-retreive-the-lock-or-unlock-state-of-your-linux-computer/181489/4
-import logging
-import dbus
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
-import random
-import paho.mqtt.publish as mqtt
+#
+# Keeps one MQTT connection open and reports whether the screen is locked and the
+# LAN is connected. Home Assistant learns about it through MQTT discovery.
+#
+# Staying visible in Home Assistant through restarts:
+#  * The discovery config, the state and an availability topic are all retained.
+#  * Everything is published again on every (re)connect, so a broker restart that
+#    drops retained messages heals itself.
+#  * Everything is published again whenever Home Assistant announces it has
+#    started ("online" on homeassistant/status).
+#  * A last will marks the device offline if the connection dies (crash, lost
+#    network, lid closed). The script also says offline itself before suspend and
+#    when it is stopped.
 
-# For Watchdog timestamp
-from datetime import datetime
-
-# For payload formatting
-import json
-
-# For IP checks
-import socket
+import configparser
 import fcntl
-import struct
-
-# For current user (and thus topic)
+import json
+import logging
 import os
 import pwd
+import socket
+import struct
+import threading
+from datetime import datetime
 
-# For config
-import configparser
+import dbus
+import paho.mqtt.client as mqtt
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
 
+try:
+    from gi.repository import GLibUnix
+    unix_signal_add = GLibUnix.signal_add
+except ImportError:  # older PyGObject
+    unix_signal_add = GLib.unix_signal_add
 
-WATCHDOG_TIMEOUT = 5   # Send watchdog every 5s
-WATCHDOG_LOG_COUNT = 24 # Log every WATCHDOG_LOG_COUNT * WATCHDOG_TIMEOUT seconds
+LAN_POLL_SECONDS = 5
 
-username = os.getlogin()
-fullname = pwd.getpwuid(os.geteuid()).pw_gecos
+user = pwd.getpwuid(os.geteuid())
+username = user.pw_name  # os.getlogin() fails without a controlling terminal
+fullname = user.pw_gecos.split(',')[0] or username
 
-config = configparser.ConfigParser()
+config = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
 config.read(os.path.expanduser('~/.config/mqtt-status-updater.conf'))
 
 mqtt_host = config.get('mqtt', 'host', fallback='localhost')
-mqtt_port = int(config.get('mqtt', 'port', fallback='1883'))
-mqtt_auth = {
-  'username': config.get('mqtt', 'username', fallback=''),
-  'password': config.get('mqtt', 'password', fallback='')
-}
+mqtt_port = config.getint('mqtt', 'port', fallback=1883)
+mqtt_username = config.get('mqtt', 'username', fallback='')
+mqtt_password = config.get('mqtt', 'password', fallback='')
+mqtt_keepalive = config.getint('mqtt', 'keepalive', fallback=15)
+mqtt_topic = config.get('mqtt', 'topic', fallback='mqtt_status_updater/' + username)
+availability_topic = mqtt_topic + '/availability'
 
 lan_interface = config.get('lan', 'interface', fallback='')
 
-mqtt_topic = config.get('mqtt', 'topic', fallback='mqtt_status_updater/' + username)
+ha_base_topic = config.get('homeassistant', 'basetopic', fallback='homeassistant')
+ha_status_topic = config.get('homeassistant', 'statustopic', fallback=ha_base_topic + '/status')
+ha_unique_id = config.get('homeassistant', 'uniqueid', fallback='mqtt_status_updater_' + username)
+ha_device_name = config.get('homeassistant', 'devicename', fallback=fullname + "'s Computer")
+ha_discovery_topic = ha_base_topic + '/sensor/' + ha_unique_id + '/config'
 
-ha_autodiscovery_sent = False
-log_failure = True
+loglevel = logging.getLevelNamesMapping().get(config.get('log', 'level', fallback='INFO').upper(), logging.INFO)
+logging.basicConfig(level=loglevel, format='%(levelname)s: %(message)s')
+logger = logging.getLogger('mqtt-status-updater')
 
+state_lock = threading.Lock()
 state = {'lastseen': 0, 'locked': True, 'lan': False}
-watchdog_messages_suppressed = 0
+loop = GLib.MainLoop()
 
-loglevel = logging.INFO
-logconfig = config.get('log', 'level', fallback='')
-if logconfig:
-    levels = logging.getLevelNamesMapping()
-    if logconfig in levels:
-        loglevel = levels[logconfig]
-logging.basicConfig(level=loglevel)
-logger = logging.getLogger("MQTT_Desktop_Status")
 
-def exit_gracefully(signum=0, frame=None):
-    logger.info('Exiting now')
-    loop.quit()
-    update_mqtt_locked_state(True, False)
-    exit(0)
-   
-def update_mqtt(reason):
-    global ha_autodiscovery_sent, watchdog_messages_suppressed, log_failure
+def discovery_payload():
+    # Same unique_id, name and Yes/No values as before, so the entity id and any
+    # automations using it are unchanged. Staleness is now handled by availability
+    # rather than comparing timestamps, which also removes any clock-skew problem.
+    return json.dumps({
+        'name': 'At Desk',
+        'icon': 'mdi:desk',
+        'state_topic': mqtt_topic,
+        'value_template': "{{ 'Yes' if value_json.lan and not value_json.locked else 'No' }}",
+        'json_attributes_topic': mqtt_topic,
+        'availability_topic': availability_topic,
+        'unique_id': ha_unique_id,
+        'device': {
+            'name': ha_device_name,
+            'identifiers': [ha_unique_id],
+        },
+        'origin': {
+            'name': 'mqtt-status-updater',
+            'url': 'https://github.com/coling/mqtt-status-updater',
+        },
+    })
 
-    if not ha_autodiscovery_sent:
-        try:
-            ha_base_topic = config.get('homeassistant', 'basetopic', fallback='homeassistant')
-            ha_unique_id = config.get('homeassistant', 'uniqueid', fallback='mqtt_status_updater_' + username)
-            ha_device_name = config.get('homeassistant', 'devicename', fallback=fullname + "'s Computer")
 
-            ha_autodiscovery_topic = ha_base_topic + '/sensor/' + ha_unique_id + '/config'
-            ha_autodiscovery_data = {
-                "name": 'At Desk',
-                "state_topic": mqtt_topic,
-                "value_template": "{{ iif( ( ( ( as_timestamp( utcnow() ) - value_json.lastseen ) < 30 ) and ( value_json.lan ) and ( not value_json.locked ) ), 'Yes', 'No' ) }}",
-                "unique_id": ha_unique_id,
-                "device": {
-                    "name": ha_device_name,
-                    "identifiers": [
-                        ha_unique_id
-                    ]
-                }
-            }
-            mqtt.single(ha_autodiscovery_topic, json.dumps(ha_autodiscovery_data), hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
-            ha_autodiscovery_sent = True
-            logger.info('Sent Home Assistant Autodiscovery Data')
-            log_failure = True
-        except:
-            if log_failure:
-                logger.warning('Cannot send Home Assistant Autodiscovery Data')
-            pass
+def publish(topic, payload, what):
+    if not client.is_connected():
+        logger.debug('Not connected; %s will be sent on reconnect', what)
+        return
+    info = client.publish(topic, payload, qos=1, retain=True)
+    if info.rc != mqtt.MQTT_ERR_SUCCESS:
+        logger.warning('Could not send %s: %s', what, mqtt.error_string(info.rc))
 
-    try:
+
+def publish_state(reason):
+    with state_lock:
+        state['lastseen'] = int(datetime.now().timestamp())
         msg = json.dumps(state)
-        mqtt.single(mqtt_topic, msg, hostname=mqtt_host, port=mqtt_port, auth=mqtt_auth)
-        if reason != 'watchdog' or not watchdog_messages_suppressed or watchdog_messages_suppressed >= WATCHDOG_LOG_COUNT:
-            suffix = ''
-            if watchdog_messages_suppressed > 1:
-                suffix = ' (' + str(watchdog_messages_suppressed - 1) + ' watchdog msgs suppressed)';
-            logger.info(f"Trigger '{reason}': Sent {msg} to topic '{mqtt_topic}'{suffix}")
-            watchdog_messages_suppressed = 1
-        else:
-            logger.debug(f"Trigger '{reason}': Sent {msg} to topic '{mqtt_topic}'")
-            watchdog_messages_suppressed = watchdog_messages_suppressed + 1
-        log_failure = True
-    except:
-        if log_failure:
-            logger.warning(f"Failed to send message to topic '{mqtt_topic}'")
-            log_failure = False
-        pass
+    publish(mqtt_topic, msg, 'state')
+    logger.info("%s: sent %s to '%s'", reason, msg, mqtt_topic)
 
-# From https://stackoverflow.com/a/1947766
+
+def publish_all(reason):
+    publish(ha_discovery_topic, discovery_payload(), 'discovery config')
+    publish(availability_topic, 'online', 'availability')
+    publish_state(reason)
+
+
+# --- MQTT callbacks (run on paho's network thread) ---
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code.is_failure:
+        logger.warning('MQTT connection refused: %s', reason_code)
+        return
+    logger.info('Connected to MQTT broker %s:%s', mqtt_host, mqtt_port)
+    client.subscribe(ha_status_topic, qos=1)
+    publish_all('connected')
+
+
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    if reason_code != 0:
+        logger.warning('Lost MQTT connection (%s); reconnecting', reason_code)
+
+
+def on_message(client, userdata, message):
+    if message.topic == ha_status_topic and message.payload == b'online':
+        logger.info('Home Assistant started; sending discovery and state again')
+        publish_all('homeassistant_online')
+
+
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                     client_id=f'mqtt-status-updater-{username}-{socket.gethostname()}')
+if mqtt_username:
+    client.username_pw_set(mqtt_username, mqtt_password)
+client.will_set(availability_topic, 'offline', qos=1, retain=True)
+client.reconnect_delay_set(min_delay=1, max_delay=30)
+client.on_connect = on_connect
+client.on_disconnect = on_disconnect
+client.on_message = on_message
+
+
+# --- Desktop state ---
+
 def get_interface_ip(ifname):
+    # From https://stackoverflow.com/a/1947766
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return socket.inet_ntoa(fcntl.ioctl(
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            return socket.inet_ntoa(fcntl.ioctl(
                 s.fileno(),
                 0x8915,  # SIOCGIFADDR
                 struct.pack('256s', bytes(ifname[:15], 'utf-8'))
-                # Python 2.7: remove the second argument for the bytes call
             )[20:24])
-    except:
-        pass
-    return None
+    except OSError:
+        return None
 
-def watchdog(reason='watchdog'):
-    global state
-    state['lastseen'] = datetime.now().timestamp()
+
+def check_lan():
     if lan_interface:
-        lanstate = bool(get_interface_ip(lan_interface))
-        if state['lan'] != lanstate:
-            state['lan'] = lanstate
-            reason = 'lanstate'
-    update_mqtt(reason)
-    return True
+        lan = bool(get_interface_ip(lan_interface))
+        with state_lock:
+            changed = state['lan'] != lan
+            state['lan'] = lan
+        if changed:
+            logger.info('LAN %s is now %s', lan_interface, 'connected' if lan else 'disconnected')
+            publish_state('lan')
+    return True  # keep the GLib timer running
 
-def set_dbus_loop():
+
+def set_locked(locked, reason='lock'):
+    locked = bool(locked)
+    with state_lock:
+        changed = state['locked'] != locked
+        state['locked'] = locked
+    if changed:  # GNOME sends ActiveChanged more than once per lock
+        logger.info('The computer is now %s', 'locked' if locked else 'unlocked')
+        publish_state(reason)
+
+
+def on_prepare_for_sleep(sleeping):
+    if sleeping:
+        logger.info('Suspending: marking offline')
+        publish(availability_topic, 'offline', 'availability')
+    else:
+        logger.info('Resumed')
+        check_lan()
+        publish_all('resume')
+
+
+def read_initial_state(session_bus):
+    try:
+        screensaver = session_bus.get_object('org.gnome.ScreenSaver', '/org/gnome/ScreenSaver')
+        state['locked'] = bool(screensaver.GetActive(dbus_interface='org.gnome.ScreenSaver'))
+    except dbus.DBusException as e:
+        logger.warning('Could not read the lock state, assuming unlocked: %s', e)
+        state['locked'] = False
+    if lan_interface:
+        state['lan'] = bool(get_interface_ip(lan_interface))
+    logger.info('Starting: locked=%s lan=%s', state['locked'], state['lan'])
+
+
+def stop(*_args):
+    logger.info('Exiting now')
+    loop.quit()
+    return GLib.SOURCE_REMOVE
+
+
+def main():
     DBusGMainLoop(set_as_default=True)
     session_bus = dbus.SessionBus()
-    session_bus.add_signal_receiver(update_mqtt_locked_state,
-                                    dbus_interface="org.gnome.ScreenSaver",
-                                    signal_name="ActiveChanged")
-    loop = GLib.MainLoop()
-    GLib.timeout_add(WATCHDOG_TIMEOUT * 1000, watchdog)
-    return loop
+    session_bus.add_signal_receiver(set_locked,
+                                    dbus_interface='org.gnome.ScreenSaver',
+                                    signal_name='ActiveChanged')
+    try:
+        dbus.SystemBus().add_signal_receiver(on_prepare_for_sleep,
+                                             dbus_interface='org.freedesktop.login1.Manager',
+                                             signal_name='PrepareForSleep')
+    except dbus.DBusException as e:
+        logger.warning('Cannot watch for suspend: %s', e)
 
-def update_mqtt_locked_state(is_locked, log = True):
-    global state
-    state['locked'] = bool(is_locked)
-    if log:
-        msg = 'The computer is now unlocked'
-        if is_locked:
-            msg = 'The computer is now locked'
-        logger.info(msg)
-    watchdog('lock')
+    read_initial_state(session_bus)
+    GLib.timeout_add_seconds(LAN_POLL_SECONDS, check_lan)
+    for sig in (2, 15):  # SIGINT, SIGTERM
+        unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
+
+    # Retries in the background until the broker is reachable.
+    client.connect_async(mqtt_host, mqtt_port, keepalive=mqtt_keepalive)
+    client.loop_start()
+    try:
+        loop.run()
+    finally:
+        # A clean disconnect doesn't fire the last will, so say offline first.
+        if client.is_connected():
+            client.publish(availability_topic, 'offline', qos=1, retain=True).wait_for_publish(timeout=2)
+        client.disconnect()
+        client.loop_stop()
+
 
 if __name__ == '__main__':
-    try:
-        update_mqtt_locked_state(False, False)
-        loop = set_dbus_loop()
-        loop.run()
-    except KeyboardInterrupt:
-        exit_gracefully()
-
+    main()

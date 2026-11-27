@@ -1,8 +1,13 @@
 [Unit]
 Description=MQTT Desktop Status Updater
+# Needs the GNOME session (screen lock signals); stops with it.
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Service]
 ExecStart=/usr/bin/mqtt-status-updater
+Restart=always
+RestartSec=10
 
 [Install]
-WantedBy=basic.target
+WantedBy=graphical-session.target
